@@ -122,7 +122,7 @@ def compress_array(array, compress):
       rng_max = int( len(array) / compress ) * compress + 1
       array = array[rng_min:rng_max]
 
-   temp = np.resize(array, (len(array)/compress, compress))
+   temp = np.resize(array, (int( len(array) / compress ), compress))
    return np.sum(temp, 1)/compress
 
 
@@ -211,7 +211,7 @@ class XrayBackground:
             else:
                 scratch = tmp
                 slope = slope * compress
-                nchans = nchans / compress
+                nchans = nchans // compress
                 
         # Copy scratch spectrum to background spectrum
         bckgnd = scratch[:]
@@ -228,7 +228,7 @@ class XrayBackground:
         indices     = np.arange(nchans*2+1, dtype=np.float) - nchans
         power_funct = indices**exponent  * (REFERENCE_AMPL / denom)
         power_funct = np.compress((power_funct <= max_counts), power_funct)
-        max_index   = len(power_funct)/2 - 1
+        max_index   = len(power_funct) // 2 - 1
         # print( "NCHANS: ", nchans, denom, min(indices), max(indices), max_index)
         for chan in range(nchans-1):
             tan_slope = 0.

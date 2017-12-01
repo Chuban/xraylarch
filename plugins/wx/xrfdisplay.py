@@ -1290,13 +1290,22 @@ class XRFDisplayFrame(wx.Frame):
                            wildcard=ASCII_WILDCARDS)
         if outfile is not None:
             self.mca.save_columnfile(outfile)
+            
+    def calibCallback(self, offset, slope, mca):
+        self.mca.offset = offset / 1000.
+        self.mca.slope = slope / 1000.
+        for m in self.mca.mcas:
+            m.offset = offset / 1000.
+            m.slope = slope / 1000.
+        self.update_mca(self.mca.get_counts(), energy=self.mca.get_energy())
 
-    def onCalibrateEnergy(self, event=None, **kws):
+    def onCalibrateEnergy(self, event=None, **kws):        
         try:
             self.win_calib.Raise()
         except:
             self.win_calib = XRFCalibrationFrame(self, mca=self.mca,
-                                              larch=self.larch)
+                                              larch=self.larch,
+                                              callback=self.calibCallback)
 
     def onFitPeaks(self, event=None, **kws):
         try:

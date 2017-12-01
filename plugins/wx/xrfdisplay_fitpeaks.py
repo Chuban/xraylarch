@@ -28,6 +28,10 @@ try:
 except ImportError:
     from larch.utils import OrderedDict
 
+import os
+import configparser    
+from lmfit.parameter import Parameters
+
 FNB_STYLE = flat_nb.FNB_NO_X_BUTTON|flat_nb.FNB_SMART_TABS|flat_nb.FNB_NO_NAV_BUTTONS
 
 def read_filterdata(flist, _larch):
@@ -44,29 +48,31 @@ def read_filterdata(flist, _larch):
 def xrf_resid(pars, peaks=None, mca=None, det=None, bgr=None,
               sig=None, filters=None, flyield=None, use_bgr=False,
               xray_en=30.0, emin=0.0, emax=30.0, **kws):
-
-    sig_o = pars.sig_o.value
-    sig_s = pars.sig_s.value
-    sig_q = pars.sig_q.value
+    
+    sig_o = pars['sig_o'].value
+    sig_s = pars['sig_s'].value
+    sig_q = pars['sig_q'].value
     model = mca.data * 0.0
     if use_bgr:
         model += mca.bgr
     for use, pcen, psig, pamp in peaks:
-        amp = pamp.value
-        cen = pcen.value
-        sig = sig_o + cen * (sig_s + sig_q * cen)
-        psig.value = sig
-        if use: model += amp*gaussian(mca.energy, cen, sig)
-
+        amp = pars[pamp.name].value
+        cen = pars[pcen.name].value
+        sig = pars[psig.name].value
+        if use: model += gaussian(mca.energy,
+                                  amplitude=amp,
+                                  center=cen,
+                                  sigma=sig)
+    
     mca.model = model
     imin = index_of(mca.energy, emin)
     imax = index_of(mca.energy, emax)
     resid = (mca.data - model)
+    
     # if det['use']:
     #     resid = resid / np.maximum(1.e-29, (1.0 - mca.det_atten))
 
     return resid[imin:imax]
-
 
 class FitSpectraFrame(wx.Frame):
     """Frame for Spectral Analysis"""
@@ -202,9 +208,9 @@ class FitSpectraFrame(wx.Frame):
                                    size=(70, -1), default=0)
 
         sopts = {'vary': True, 'precision': 5}
-        sig_offset = Parameter(value=0.050, name=self.gsig_offset, vary=True)
-        sig_slope  = Parameter(value=0.005, name=self.gsig_slope, vary=True)
-        sig_quad   = Parameter(value=0.000, name=self.gsig_quad, vary=False)
+        sig_offset = Parameter(value=0.050, name=self.gsig_offset, vary=True, min=0)
+        sig_slope  = Parameter(value=0.005, name=self.gsig_slope, vary=True, min=0)
+        sig_quad   = Parameter(value=0.000, name=self.gsig_quad, vary=False, min=0)
 
         setattr(self.paramgroup, self.gsig_offset, sig_offset)
         setattr(self.paramgroup, self.gsig_slope, sig_slope)
@@ -403,15 +409,22 @@ class FitSpectraFrame(wx.Frame):
             t = det['thickness']
             mca.det_atten = np.exp(-t*mu)
 
-        fit = Minimizer(xrf_resid, self.paramgroup, toler=1.e-4,
-                        _larch=_larch, fcn_kws = opts)
-        fit.leastsq()
+        p = Parameters()
+        p['sig_o'] = getattr(self.paramgroup, 'sig_o')
+        p['sig_s'] = getattr(self.paramgroup, 'sig_s')
+        p['sig_q'] = getattr(self.paramgroup, 'sig_q')
+        for param in dir(self.paramgroup):
+            p[param] = getattr(self.paramgroup, param)
+        
+        fit = Minimizer(xrf_resid, p, fcn_kws = opts)
+        
+        lineResult = fit.leastsq()
         parent = self.parent
         parent.oplot(mca.energy, mca.model,
                      label='fit', style='solid',
                      color='#DD33DD')
-
-        print( fitting.fit_report(self.paramgroup, _larch=_larch))
+                     
+        print( fitting.fit_report(lineResult.params, _larch=_larch) )
 
         # filters:
         #  75 microns kapton, etc
@@ -420,7 +433,62 @@ class FitSpectraFrame(wx.Frame):
         # mu = material_mu(material, energy*1000.0, _larch=_larch)/10.0
         # mu = mu * nominal_density/user_density
         # scale = exp(-thickness*mu)
+        
+        # Build a list of elements for analysis.
+        # Add a parameter for each elemental concentration.
+        # Try to retrieve the calibration value for each line.
+        #   Add a FIXED calibration parameter.
+        # Otherwise, add a VARIABLE calibration parameter for the line.
+        
+        calibValues = configparser.ConfigParser()
+        
+        dlg = wx.FileDialog(self, message="Open Calibration File",
+                            defaultDir=os.getcwd(),
+                            wildcard="CAL File (*.cal)|*.cal|All Files (*.*)|*.*",
+                            style = wx.FD_OPEN|wx.FD_CHANGE_DIR)
 
+        fName= None
+        if dlg.ShowModal() == wx.ID_OK:
+            fName = os.path.abspath(dlg.GetPath())
+        dlg.Destroy()
 
+        if fName is None:
+            return
+        calibValues.read(fName)
+        
+        lineData = {}
+        for param in lineResult.params:
+            if param.split('_')[1] == 'amp':
+                line = param.split('_')[0]
+                intensity = lineResult.params[param].value
+                intensity /= self.mca.live_time
+                try:
+                    if lineData[param[:2]][1] < intensity:
+                        lineData[param[:2]] = (line, intensity)
+                except:
+                    lineData[param[:2]] = (line, intensity)
+        
+        p = Parameters()
+        totalCounts = np.sum([val[1] for val in lineData.values()])
+        for (elem, data) in lineData.items():
+            
+            calibration = calibValues['DEFAULT'].getfloat(data[0])
+            if data[0] in calibValues['DEFAULT']:
+                p[elem+'_calib'] = Parameter(value=calibration,
+                                             vary=False,
+                                             name=elem+'_calib')
+            else:
+                p[elem+'_calib'] = Parameter(value=1.0,
+                                             vary=True,
+                                             min=0.0,
+                                             name=elem+'_calib')
+            
+            initialC = data[1] / totalCounts
+            p['C_'+elem] = Parameter(value=initialC,
+                                     vary=True,
+                                     min=0.0, max=1.0,
+                                     name='C_'+elem)
+        
+        
     def onClose(self, event=None):
         self.Destroy()

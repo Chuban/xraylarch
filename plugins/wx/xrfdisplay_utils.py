@@ -161,8 +161,8 @@ class XRFCalibrationFrame(wx.Frame):
 
     def onUseCalib(self, event=None):
         mca = self.mca
-        offset = float(self.new_offset.GetValue())
-        slope  = float(self.new_slope.GetValue())
+        offset = float(self.new_offset.Value)
+        slope  = float(self.new_slope.Value)
         mca.new_calib = offset, slope
         xrf_calib_apply(mca, offset=offset, slope=slope, _larch=self.larch)
         if hasattr(self.callback, '__call__'):
