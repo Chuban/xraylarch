@@ -31,6 +31,8 @@ except ImportError:
 import os
 import configparser    
 from lmfit.parameter import Parameters
+from larch_plugins.xray import xray_edge, mu_elam
+from larch_plugins.xray.xraydb_plugin import fluo_yield
 
 FNB_STYLE = flat_nb.FNB_NO_X_BUTTON|flat_nb.FNB_SMART_TABS|flat_nb.FNB_NO_NAV_BUTTONS
 
@@ -73,6 +75,88 @@ def xrf_resid(pars, peaks=None, mca=None, det=None, bgr=None,
     #     resid = resid / np.maximum(1.e-29, (1.0 - mca.det_atten))
 
     return resid[imin:imax]
+
+def concentration_resid(pars, lineData=None, mca=None,
+                        phiPrime=np.pi/2.,
+                        phiDblPrime=np.pi/2.,
+                        xray_energy=30000.,
+                        larch=None):
+    
+    cscPhiPrime = 1. / np.sin(phiPrime)
+    cscPhiDblPrime = 1. / np.sin(phiDblPrime)
+    energy = mca.get_energy() * 1000.
+    dE = energy[1] - energy[0]
+    probeSpectrum = np.zeros(len(energy))
+    ind = index_of(energy, xray_energy)
+    probeSpectrum[ind] = 1.0
+    C = np.array([pars[elem+'_con'].value for elem in lineData], ndmin=2).T
+    Cal = np.array([pars[elem+'_cal'].value for elem in lineData])
+    Intensity = np.array([lineData[elem][2] for elem in lineData])
+    
+    mu = np.zeros((len(lineData)+1, len(energy)))
+    for i, elem_i in enumerate(lineData):
+        mu[i,:]   = mu_elam(elem_i, energy, kind='total', _larch=larch)
+        mu[-1,:] += C[i,0] * mu[i,:]
+    
+    beta = np.zeros((len(lineData), len(lineData), len(energy)))
+    delta = np.zeros((len(lineData), len(lineData), len(energy)))
+    for i, elem_i in enumerate(lineData):
+        
+        line_en_i = lineData[elem_i][1]
+        
+        edge_i = lineData[elem_i][0][len(elem_i)].title()
+        edge_en_i, _, r_i = xray_edge(elem_i, edge_i, _larch=larch)
+        
+        for j, elem_j in enumerate(lineData):
+            
+            line_en_j = lineData[elem_j][1]
+            
+            edge_j = lineData[elem_j][0][len(elem_j)].title()
+            line_j = lineData[elem_j][0][len(elem_j):].title()
+            edge_en_j, _, r_j = xray_edge(elem_j, edge_j, _larch=larch)
+            yield_j, _, prob_j = fluo_yield(elem_j, edge_j, line_j, np.max(energy), _larch=larch)
+            k_j = prob_j * yield_j * (r_j - 1.) / r_j
+            
+            mu_s_prime = mu[-1,:] * cscPhiPrime
+            mu_s_line_en_j = np.interp(line_en_j, energy, mu[-1,:])
+            mu_s_dblPrime_line_en_i = np.interp(line_en_i, energy, mu[-1,:]) * cscPhiDblPrime
+            
+            P_ij = np.log(1. + mu_s_prime / mu_s_line_en_j) / mu_s_prime + \
+                   np.log(1. + mu_s_dblPrime_line_en_i / mu_s_line_en_j) / mu_s_dblPrime_line_en_i
+            
+            beta[i,j,:]  = mu[j,:] * cscPhiPrime + \
+                           np.interp(line_en_i, energy, mu[j,:]) * cscPhiDblPrime
+            beta[i,j,:] /= mu[i,:] * cscPhiPrime + \
+                           np.interp(line_en_i, energy, mu[i,:]) * cscPhiDblPrime
+            beta[i,j,:] -= 1.
+            
+            delta[i,j,:]  = np.where(energy >= edge_en_j, 0.5, 0.0)
+            if line_en_j <= edge_en_i: delta[i,j,:] *= 0.
+            delta[i,j,:] *= k_j
+            delta[i,j,:] *= mu[j,:] * cscPhiPrime
+            delta[i,j,:] *= np.interp(line_en_j, energy, mu[i,:])
+            delta[i,j,:] /= (mu[-1,:] * cscPhiPrime) + \
+                            (np.interp(line_en_i, energy, mu[-1,:]) * cscPhiDblPrime)
+            delta[i,j,:] *= P_ij
+    
+    W = np.zeros((1, len(lineData), len(energy)))
+    for i, elem in enumerate(lineData):
+        line_en_i = lineData[elem_i][1]
+        mu_i_star = mu[i,:] * cscPhiPrime +\
+                    np.interp(line_en_i, energy, mu[i,:]) * cscPhiDblPrime
+        W[0,i,:]  = mu[i,:] * probeSpectrum * dE
+        W[0,i,:] /= mu_i_star * (1 + np.sum(C * beta[i,:,:], axis=0))
+    
+    alpha = np.sum(W * beta, axis=2) / np.sum(W, axis=2)
+    epsilon = np.sum(W * delta, axis=2) / np.sum(W, axis=2)
+    
+    num = 1 + np.sum(C.T * epsilon, axis=1)
+    den = 1 + np.sum(C.T * alpha, axis=1)
+    
+    C = np.reshape(C, (len(C)))
+    print(pars['cu_con'].value, pars['zn_con'].value, pars['mn_con'].value)
+    
+    return Intensity - Cal * C * num / den
 
 class FitSpectraFrame(wx.Frame):
     """Frame for Spectral Analysis"""
@@ -425,70 +509,6 @@ class FitSpectraFrame(wx.Frame):
                      color='#DD33DD')
                      
         print( fitting.fit_report(lineResult.params, _larch=_larch) )
-
-        # filters:
-        #  75 microns kapton, etc
-        #
-        # form, nominal_density = material_get(material)
-        # mu = material_mu(material, energy*1000.0, _larch=_larch)/10.0
-        # mu = mu * nominal_density/user_density
-        # scale = exp(-thickness*mu)
-        
-        # Build a list of elements for analysis.
-        # Add a parameter for each elemental concentration.
-        # Try to retrieve the calibration value for each line.
-        #   Add a FIXED calibration parameter.
-        # Otherwise, add a VARIABLE calibration parameter for the line.
-        
-        calibValues = configparser.ConfigParser()
-        
-        dlg = wx.FileDialog(self, message="Open Calibration File",
-                            defaultDir=os.getcwd(),
-                            wildcard="CAL File (*.cal)|*.cal|All Files (*.*)|*.*",
-                            style = wx.FD_OPEN|wx.FD_CHANGE_DIR)
-
-        fName= None
-        if dlg.ShowModal() == wx.ID_OK:
-            fName = os.path.abspath(dlg.GetPath())
-        dlg.Destroy()
-
-        if fName is None:
-            return
-        calibValues.read(fName)
-        
-        lineData = {}
-        for param in lineResult.params:
-            if param.split('_')[1] == 'amp':
-                line = param.split('_')[0]
-                intensity = lineResult.params[param].value
-                intensity /= self.mca.live_time
-                try:
-                    if lineData[param[:2]][1] < intensity:
-                        lineData[param[:2]] = (line, intensity)
-                except:
-                    lineData[param[:2]] = (line, intensity)
-        
-        p = Parameters()
-        totalCounts = np.sum([val[1] for val in lineData.values()])
-        for (elem, data) in lineData.items():
-            
-            calibration = calibValues['DEFAULT'].getfloat(data[0])
-            if data[0] in calibValues['DEFAULT']:
-                p[elem+'_calib'] = Parameter(value=calibration,
-                                             vary=False,
-                                             name=elem+'_calib')
-            else:
-                p[elem+'_calib'] = Parameter(value=1.0,
-                                             vary=True,
-                                             min=0.0,
-                                             name=elem+'_calib')
-            
-            initialC = data[1] / totalCounts
-            p['C_'+elem] = Parameter(value=initialC,
-                                     vary=True,
-                                     min=0.0, max=1.0,
-                                     name='C_'+elem)
-        
         
     def onClose(self, event=None):
         self.Destroy()
